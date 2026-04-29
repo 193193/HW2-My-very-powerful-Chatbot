@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini 2.5 Flash Chat</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        :root { --bg: #f4f7f6; --primary: #1a73e8; --chat-bg: #fff; --danger: #d93025; }
+        body { font-family: -apple-system, system-ui, sans-serif; background: var(--bg); margin: 0; display: flex; flex-direction: column; height: 100vh; }
+        #toolbar { background: #fff; padding: 10px 20px; border-bottom: 1px solid #ddd; display: flex; gap: 10px; align-items: center; }
+        #chat-container { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 15px; }
+        .msg { max-width: 80%; padding: 12px 16px; border-radius: 15px; line-height: 1.5; word-wrap: break-word; }
+        .user { align-self: flex-end; background: var(--primary); color: white; }
+        .model { align-self: flex-start; background: var(--chat-bg); box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .error-msg { background: #fdecea; color: var(--danger); border: 1px solid #f5c2c7; align-self: center; text-align: center; }
+        .retry-btn { background: var(--danger); color: white; border: none; padding: 5px 10px; border-radius: 5px; cursor: pointer; margin-top: 8px; }
+        .img-preview { max-width: 200px; border-radius: 8px; margin-top: 5px; display: block; }
+        #input-area { padding: 20px; background: white; border-top: 1px solid #ddd; display: flex; gap: 10px; align-items: center; }
+        input[type="text"] { flex: 1; padding: 12px; border: 1px solid #ccc; border-radius: 8px; outline: none; }
+        .btn { padding: 10px 15px; border-radius: 8px; cursor: pointer; border: none; font-size: 0.9em; transition: 0.2s; }
+        #send-btn { background: var(--primary); color: white; }
+        #clear-btn { background: var(--danger); color: white; }
+        #new-chat-btn { background: #eee; color: #333; }
+        #file-label { cursor: pointer; background: #e8f0fe; padding: 10px; border-radius: 8px; color: var(--primary); }
+    </style>
+</head>
+<body>
+
+<div id="toolbar">
+    <button id="new-chat-btn" class="btn">＋ 新對話</button>
+    <button id="clear-btn" class="btn">🗑️ 清除所有記憶</button>
+    <div id="status" style="font-size: 0.8em; color: #666; margin-left: auto;">Gemini 準備就緒</div>
+</div>
+
+<div id="chat-container"></div>
+
+<div id="input-area">
+    <label id="file-label" for="file-input">📷
+        <input type="file" id="file-input" accept="image/*" style="display:none">
+    </label>
+    <input type="text" id="user-input" placeholder="輸入訊息..." autocomplete="off">
+    <button id="send-btn" class="btn">發送</button>
+</div>
+
+<script src="config.js"></script>
+
+<script type="module">
+    import { GoogleGenerativeAI } from "https://esm.run/@google/generative-ai";
+
+    const API_KEY = window.CONFIG?.API_KEY; 
+    const genAI = new GoogleGenerativeAI(API_KEY);
+    
+    const MEMORY_KEY = "GEMINI_LONG_TERM_MEM";
+    const CALENDAR_KEY = "GEMINI_CAL_DATA";
+    
+    let chatHistory = JSON.parse(localStorage.getItem(MEMORY_KEY)) || [];
+    let calendarData = JSON.parse(localStorage.getItem(CALENDAR_KEY)) || {};
+    let lastUserMessage = ""; // 用於重試功能
+
+    const chatContainer = document.getElementById('chat-container');
+    const userInput = document.getElementById('user-input');
+    const sendBtn = document.getElementById('send-btn');
+    const fileInput = document.getElementById('file-input');
+
+    // 初始載入
+    chatHistory.forEach(msg => appendMessage(msg.role, msg.parts[0].text, false));
+
+    function appendMessage(role, text, save = true) {
+        const div = document.createElement('div');
+        div.className = `msg ${role}`;
+        div.innerHTML = role === 'model' ? marked.parse(text) : text;
+        chatContainer.appendChild(div);
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+        
+        if (save) {
+            chatHistory.push({ role, parts: [{ text }] });
+            localStorage.setItem(MEMORY_KEY, JSON.stringify(chatHistory));
+        }
+        return div;
+    }
+
+    async function handleSend(retryText = null) {
+        const text = retryText || userInput.value.trim();
+        const file = fileInput.files[0];
+        if (!text && !file) return;
+
+        lastUserMessage = text; // 存檔以備重試
+        const modelName = (text.length > 50 || file) ? "gemini-2.5-flash" : "gemini-2.5-flash-lite";
+        document.getElementById('status').innerText = `使用模型：${modelName}`;
+        
+        const model = genAI.getGenerativeModel({ 
+            model: modelName,
+            systemInstruction: "你是一個擁有完美記憶的助理。你的對話歷史存放在 history 中。除非使用者要求查看日曆或提及時間計畫，否則以對話記憶為優先回答。請使用繁體中文。"
+        });
+        
+        if (!retryText) userInput.value = '';
+        
+        let imageData = null;
+        if (file && !retryText) {
+            imageData = await fileToGenerativePart(file);
+            appendMessage('user', text || "分析圖片");
+            const imgEl = document.createElement('img');
+            imgEl.src = URL.createObjectURL(file);
+            imgEl.className = 'img-preview';
+            chatContainer.lastChild.appendChild(imgEl);
+        } else if (!retryText) {
+            appendMessage('user', text);
+        }
+
+        const loadingDiv = appendMessage('model', '...', false);
+        
+        try {
+            const calendarContext = `\n[Context: 今天的日期是 2026-04-29。日曆現有內容: ${JSON.stringify(calendarData)}。若需更改日曆，回覆JSON {"action":"write","date":"YYYY-MM-DD","task":"內容"}。]`;
+            
+            let result;
+            if (imageData) {
+                result = await model.generateContent([text + calendarContext, imageData]);
+            } else {
+                const chatSession = model.startChat({ 
+                    history: chatHistory.map(h => ({ role: h.role, parts: h.parts })).slice(-30) 
+                });
+                result = await chatSession.sendMessage(text + calendarContext);
+            }
+
+            let aiResponse = result.response.text();
+
+            // 處理 MCP 日曆 JSON
+            if (aiResponse.includes('"action"')) {
+                const match = aiResponse.match(/\{.*\}/s);
+                if (match) {
+                    const cmd = JSON.parse(match[0]);
+                    if (cmd.action === "write") {
+                        calendarData[cmd.date] = cmd.task;
+                        localStorage.setItem(CALENDAR_KEY, JSON.stringify(calendarData));
+                        aiResponse = `✅ 已為您在 ${cmd.date} 紀錄：${cmd.task}`;
+                    } else if (cmd.action === "read") {
+                        aiResponse = `📅 ${cmd.date} 的紀錄：${calendarData[cmd.date] || "無任務"}`;
+                    }
+                }
+            }
+
+            loadingDiv.innerHTML = marked.parse(aiResponse);
+            chatHistory.push({ role: 'model', parts: [{ text: aiResponse }] });
+            localStorage.setItem(MEMORY_KEY, JSON.stringify(chatHistory));
+            loadingDiv.classList.remove('loading');
+            fileInput.value = '';
+        } catch (error) {
+            loadingDiv.classList.add('error-msg');
+            loadingDiv.innerHTML = `<div>系統繁忙或發生非預期錯誤 (Code: ${error.message.includes('503') ? '503' : 'Error'})</div>
+            <button class="retry-btn" onclick="this.parentElement.remove(); window.handleRetry()">點擊重試</button>`;
+        }
+    }
+
+    // 將重試功能掛載到 window 供按鈕調用
+    window.handleRetry = () => handleSend(lastUserMessage);
+
+    async function fileToGenerativePart(file) {
+        const base64Data = await new Promise(resolve => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result.split(',')[1]);
+            reader.readAsDataURL(file);
+        });
+        return { inlineData: { data: base64Data, mimeType: file.type } };
+    }
+
+    document.getElementById('new-chat-btn').onclick = () => {
+        chatContainer.innerHTML = '';
+        // 歷史記憶保留在陣列中但不顯示在畫面，直到新對話觸發
+    };
+
+    document.getElementById('clear-btn').onclick = () => {
+        if(confirm("確定要刪除所有跨對話紀錄與日曆資料嗎？")) {
+            localStorage.clear();
+            location.reload();
+        }
+    };
+
+    sendBtn.onclick = () => handleSend();
+    userInput.addEventListener('keypress', (e) => { if(e.key === 'Enter') handleSend(); });
+</script>
+
+</body>
+</html>
